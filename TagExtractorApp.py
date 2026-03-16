@@ -11,6 +11,9 @@ import io
 import locale
 import tempfile
 
+http_session = requests.Session()
+cache = {}
+
 LANG = {
     'ru': {
         'title': 'Tag Extractor',
@@ -151,7 +154,7 @@ def extract_identifier(url):
     path = parsed.path
     query = parsed.query
 
-    if 'danbooru.donmai.us' in domain or 'aibooru.online' in domain:
+    if 'danbooru.donmai.us' in domain or 'aibooru' in domain:
         m = re.search(r'/posts/(\d+)', path)
         if m:
             return domain, m.group(1)
@@ -195,6 +198,10 @@ def extract_identifier(url):
     return None, None
 
 def fetch_danbooru_post(identifier):
+    cache_key = ('danbooru', identifier)
+    if cache_key in cache:
+        return cache[cache_key]
+
     if str(identifier).startswith('md5:'):
         params = {'tags': identifier}
     else:
@@ -202,47 +209,63 @@ def fetch_danbooru_post(identifier):
     url = 'https://danbooru.donmai.us/posts.json'
 
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = http_session.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, list) or len(data) == 0:
+            cache[cache_key] = None
             return None
         post = data[0]
         raw_tags = post.get('tag_string', '').split()
         tags = [clean_tag(t) for t in raw_tags] if raw_tags else None
-        return {
+        result = {
             'tags': tags,
             'file_url': post.get('file_url'),
             'md5': post.get('md5')
         }
+        cache[cache_key] = result
+        return result
     except:
+        cache[cache_key] = None
         return None
 
-def fetch_aibooru_post(identifier):
+def fetch_aibooru_post(identifier, base_url='https://aibooru.online'):
+    cache_key = ('aibooru', base_url, identifier)
+    if cache_key in cache:
+        return cache[cache_key]
+
     if str(identifier).startswith('md5:'):
         params = {'tags': identifier}
     else:
         params = {'tags': f'id:{identifier}'}
-    url = 'https://aibooru.online/posts.json'
+    url = f"{base_url}/posts.json"
 
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = http_session.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, list) or len(data) == 0:
+            cache[cache_key] = None
             return None
         post = data[0]
         raw_tags = post.get('tag_string', '').split()
         tags = [clean_tag(t) for t in raw_tags] if raw_tags else None
-        return {
+        result = {
             'tags': tags,
             'file_url': post.get('file_url'),
             'md5': post.get('md5')
         }
+        cache[cache_key] = result
+        return result
     except:
+        cache[cache_key] = None
         return None
 
 def fetch_konachan_post(domain, identifier):
+    cache_key = ('konachan', domain, identifier)
+    if cache_key in cache:
+        return cache[cache_key]
+
     base_url = f"https://{domain}"
     if str(identifier).startswith('md5:'):
         params = {'tags': identifier}
@@ -251,39 +274,51 @@ def fetch_konachan_post(domain, identifier):
     url = f"{base_url}/post.json"
 
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = http_session.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, list) or len(data) == 0:
+            cache[cache_key] = None
             return None
         post = data[0]
         raw_tags = post.get('tags', '').split()
         tags = [clean_tag(t) for t in raw_tags] if raw_tags else None
         file_url = post.get('file_url') or post.get('jpeg_url') or post.get('sample_url')
-        return {
+        result = {
             'tags': tags,
             'file_url': file_url,
             'md5': post.get('md5')
         }
+        cache[cache_key] = result
+        return result
     except:
+        cache[cache_key] = None
         return None
 
 def fetch_yandere_post(identifier):
+    cache_key = ('yandere', identifier)
+    if cache_key in cache:
+        return cache[cache_key]
+
     url = f"https://yande.re/post.json?tags=id:{identifier}"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = http_session.get(url, timeout=10)
         data = resp.json()
         if not data or len(data) == 0:
+            cache[cache_key] = None
             return None
         post = data[0]
         raw_tags = post.get('tags', '').split()
         tags = [clean_tag(t) for t in raw_tags] if raw_tags else None
-        return {
+        result = {
             'tags': tags,
             'file_url': post.get('file_url'),
             'md5': post.get('md5')
         }
+        cache[cache_key] = result
+        return result
     except:
+        cache[cache_key] = None
         return None
 
 def filter_gelbooru_tags(tags):
@@ -326,6 +361,10 @@ def filter_gelbooru_tags(tags):
     return filtered
 
 def fetch_gelbooru_post(identifier, log_callback=None, lang_dict=None):
+    cache_key = ('gelbooru', identifier)
+    if cache_key in cache:
+        return cache[cache_key]
+
     url = "https://gelbooru.com/index.php"
     params = {
         'page': 'dapi',
@@ -338,7 +377,7 @@ def fetch_gelbooru_post(identifier, log_callback=None, lang_dict=None):
     file_url = None
     md5 = None
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = http_session.get(url, params=params, timeout=10)
         data = resp.json()
         if isinstance(data, dict) and 'post' in data:
             posts = data['post']
@@ -359,17 +398,19 @@ def fetch_gelbooru_post(identifier, log_callback=None, lang_dict=None):
             if tags:
                 if log_callback and lang_dict:
                     log_callback(lang_dict['gelbooru_parsed_tags'].format(len(tags)))
-                return {
+                result = {
                     'tags': tags,
                     'file_url': file_url,
                     'md5': md5
                 }
+                cache[cache_key] = result
+                return result
     except Exception as e:
         pass
 
     html_url = f"https://gelbooru.com/index.php?page=post&s=view&id={identifier}"
     try:
-        html_resp = requests.get(html_url, timeout=10)
+        html_resp = http_session.get(html_url, timeout=10)
         html = html_resp.text
 
         og_match = re.search(r'<meta property="og:image" content="([^"]+)"', html)
@@ -388,11 +429,13 @@ def fetch_gelbooru_post(identifier, log_callback=None, lang_dict=None):
             tags = [clean_tag(t) for t in filtered_keywords] if filtered_keywords else None
             if tags and log_callback and lang_dict:
                 log_callback(lang_dict['gelbooru_parsed_tags'].format(len(tags)))
-                return {
+                result = {
                     'tags': tags,
                     'file_url': file_url,
                     'md5': md5
                 }
+                cache[cache_key] = result
+                return result
 
         if not tags:
             tag_list_section = re.search(r'<div[^>]*(?:id="tag-list"|class="[^"]*tag-list[^"]*")[^>]*>(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
@@ -406,23 +449,29 @@ def fetch_gelbooru_post(identifier, log_callback=None, lang_dict=None):
                         tags = [clean_tag(t) for t in filtered_tags]
                         if tags and log_callback and lang_dict:
                             log_callback(lang_dict['gelbooru_parsed_tags'].format(len(tags)))
-                            return {
+                            result = {
                                 'tags': tags,
                                 'file_url': file_url,
                                 'md5': md5
                             }
+                            cache[cache_key] = result
+                            return result
 
-        return {
+        result = {
             'tags': tags,
             'file_url': file_url,
             'md5': md5
         }
+        cache[cache_key] = result
+        return result
     except Exception as e:
-        return {
+        result = {
             'tags': None,
             'file_url': None,
             'md5': None
         }
+        cache[cache_key] = result
+        return result
 
 def get_image_info_from_source(domain, identifier):
     if 'yande.re' in domain:
@@ -442,7 +491,7 @@ def get_image_info_from_source(domain, identifier):
 def search_on_danbooru_by_md5(md5):
     url = f"https://danbooru.donmai.us/posts.json?tags=md5:{md5}"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = http_session.get(url, timeout=10)
         data = resp.json()
         if data and len(data) > 0:
             return data[0].get('id')
@@ -452,7 +501,7 @@ def search_on_danbooru_by_md5(md5):
 
 def search_on_danbooru_by_iqdb(image_url):
     try:
-        img_resp = requests.get(image_url, stream=True, timeout=15)
+        img_resp = http_session.get(image_url, stream=True, timeout=15)
         if img_resp.status_code != 200:
             return None
         files = {'file': ('image.jpg', img_resp.content, 'image/jpeg')}
@@ -477,7 +526,7 @@ def search_on_gelbooru_by_md5(md5):
         'tags': f'md5:{md5}'
     }
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = http_session.get(url, params=params, timeout=10)
         data = resp.json()
         if isinstance(data, dict) and 'post' in data:
             posts = data['post']
@@ -493,7 +542,7 @@ def search_on_gelbooru_by_md5(md5):
 
 def search_on_gelbooru_by_iqdb(image_url):
     try:
-        img_resp = requests.get(image_url, stream=True, timeout=15)
+        img_resp = http_session.get(image_url, stream=True, timeout=15)
         if img_resp.status_code != 200:
             return None
         files = {'file': ('image.jpg', img_resp.content, 'image/jpeg')}
@@ -516,7 +565,7 @@ def get_image_hash(image_url, hash_size=8):
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Referer': 'https://gelbooru.com/'
             }
-        resp = requests.get(image_url, headers=headers, timeout=10)
+        resp = http_session.get(image_url, headers=headers, timeout=10)
         resp.raise_for_status()
         img = Image.open(io.BytesIO(resp.content))
         img = img.convert('L').resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
@@ -807,9 +856,9 @@ class TagExtractorApp(tk.Tk):
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                         'Referer': 'https://gelbooru.com/'
                     }
-                    resp = requests.get(image_url, headers=headers, timeout=10)
+                    resp = http_session.get(image_url, headers=headers, timeout=10)
                 else:
-                    resp = requests.get(image_url, timeout=10)
+                    resp = http_session.get(image_url, timeout=10)
                 resp.raise_for_status()
                 img_data = resp.content
                 pil_image = Image.open(io.BytesIO(img_data))
@@ -880,7 +929,7 @@ class TagExtractorApp(tk.Tk):
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                             'Referer': 'https://gelbooru.com/'
                         }
-                    resp = requests.get(url, headers=headers, timeout=10)
+                    resp = http_session.get(url, headers=headers, timeout=10)
                     resp.raise_for_status()
                     img = Image.open(io.BytesIO(resp.content))
                     img.thumbnail(thumb_size, Image.Resampling.LANCZOS)
@@ -946,9 +995,10 @@ class TagExtractorApp(tk.Tk):
                                           domain_slug=domain_slug, post_id=file_id)
                 self.log(LANG[lang]['saved_tags'].format(len(tags), os.path.basename(saved)))
 
-            elif 'aibooru.online' in domain:
+            elif 'aibooru' in domain:
                 self.log(LANG[lang]['direct_request'].format(domain))
-                post_data = fetch_aibooru_post(identifier)
+                base_url = f"https://{domain}"
+                post_data = fetch_aibooru_post(identifier, base_url=base_url)
                 if not post_data or not post_data['tags']:
                     self.log(LANG[lang]['error_no_tags'])
                     return
@@ -996,31 +1046,19 @@ class TagExtractorApp(tk.Tk):
                         if db_post:
                             danbooru_image_url = db_post.get('file_url')
 
-                self.log(LANG[lang]['search_gelbooru'])
-                gelbooru_id = None
-                gelbooru_post = None
-                gelbooru_image_url = None
-                if md5:
-                    gelbooru_id = search_on_gelbooru_by_md5(md5)
-                    if gelbooru_id:
-                        self.log(LANG[lang]['found_gelbooru'])
-                        gelbooru_post = fetch_gelbooru_post(gelbooru_id)
-                        if gelbooru_post:
-                            gelbooru_image_url = gelbooru_post.get('file_url')
-                if not gelbooru_id and file_url:
-                    gelbooru_id = search_on_gelbooru_by_iqdb(file_url)
-                    if gelbooru_id:
-                        self.log(LANG[lang]['found_gelbooru'])
-                        gelbooru_post = fetch_gelbooru_post(gelbooru_id)
-                        if gelbooru_post:
-                            gelbooru_image_url = gelbooru_post.get('file_url')
-
                 sources = []
                 sources.append(('source', konachan_tags, 'Konachan', source_image_url))
                 if db_post and db_post.get('tags'):
                     sources.append(('danbooru', db_post['tags'], danbooru_id, danbooru_image_url))
-                if gelbooru_post and gelbooru_post.get('tags'):
-                    sources.append(('gelbooru', gelbooru_post['tags'], gelbooru_id, gelbooru_image_url))
+
+                if (not db_post or not db_post.get('tags')) and file_url:
+                    self.log(LANG[lang]['search_gelbooru'])
+                    gelbooru_id = search_on_gelbooru_by_iqdb(file_url)
+                    if gelbooru_id:
+                        self.log(LANG[lang]['found_gelbooru'])
+                        gelbooru_post = fetch_gelbooru_post(gelbooru_id, log_callback=self.log, lang_dict=LANG[lang])
+                        if gelbooru_post and gelbooru_post.get('tags'):
+                            sources.append(('gelbooru', gelbooru_post['tags'], gelbooru_id, gelbooru_post.get('file_url')))
 
                 if db_post and db_post.get('tags') and source_image_url and danbooru_image_url:
                     if md5 is None or db_post.get('md5') != md5:
@@ -1127,31 +1165,19 @@ class TagExtractorApp(tk.Tk):
                         if db_post:
                             danbooru_image_url = db_post.get('file_url')
 
-                self.log(LANG[lang]['search_gelbooru'])
-                gelbooru_id = None
-                gelbooru_post = None
-                gelbooru_image_url = None
-                if md5:
-                    gelbooru_id = search_on_gelbooru_by_md5(md5)
-                    if gelbooru_id:
-                        self.log(LANG[lang]['found_gelbooru'])
-                        gelbooru_post = fetch_gelbooru_post(gelbooru_id)
-                        if gelbooru_post:
-                            gelbooru_image_url = gelbooru_post.get('file_url')
-                if not gelbooru_id and file_url:
-                    gelbooru_id = search_on_gelbooru_by_iqdb(file_url)
-                    if gelbooru_id:
-                        self.log(LANG[lang]['found_gelbooru'])
-                        gelbooru_post = fetch_gelbooru_post(gelbooru_id)
-                        if gelbooru_post:
-                            gelbooru_image_url = gelbooru_post.get('file_url')
-
                 sources = []
                 sources.append(('source', yandere_tags, 'Yande.re', source_image_url))
                 if db_post and db_post.get('tags'):
                     sources.append(('danbooru', db_post['tags'], danbooru_id, danbooru_image_url))
-                if gelbooru_post and gelbooru_post.get('tags'):
-                    sources.append(('gelbooru', gelbooru_post['tags'], gelbooru_id, gelbooru_image_url))
+
+                if (not db_post or not db_post.get('tags')) and file_url:
+                    self.log(LANG[lang]['search_gelbooru'])
+                    gelbooru_id = search_on_gelbooru_by_iqdb(file_url)
+                    if gelbooru_id:
+                        self.log(LANG[lang]['found_gelbooru'])
+                        gelbooru_post = fetch_gelbooru_post(gelbooru_id, log_callback=self.log, lang_dict=LANG[lang])
+                        if gelbooru_post and gelbooru_post.get('tags'):
+                            sources.append(('gelbooru', gelbooru_post['tags'], gelbooru_id, gelbooru_post.get('file_url')))
 
                 if db_post and db_post.get('tags') and source_image_url and danbooru_image_url:
                     if md5 is None or db_post.get('md5') != md5:
@@ -1224,91 +1250,16 @@ class TagExtractorApp(tk.Tk):
             elif 'gelbooru.com' in domain:
                 self.log(LANG[lang]['source_info'].format(domain, identifier))
                 post_data = fetch_gelbooru_post(identifier, log_callback=self.log, lang_dict=LANG[lang])
-                source_image_url = post_data.get('file_url') if post_data else None
-                if source_image_url:
-                    self.set_preview(source_image_url)
-                else:
-                    self.log(LANG[lang]['preview_fail'])
+                if not post_data or not post_data['tags']:
+                    self.log(LANG[lang]['error_no_tags'])
+                    return
+                tags = post_data['tags']
+                if post_data['file_url']:
+                    self.set_preview(post_data['file_url'])
+                saved = save_tags_to_file(tags, url, self.save_folder.get(),
+                                          domain_slug=domain_slug, post_id=file_id)
+                self.log(LANG[lang]['saved_from_source'].format(len(tags), 'Gelbooru', os.path.basename(saved)))
 
-                md5 = post_data.get('md5') if post_data else None
-                file_url = post_data.get('file_url') if post_data else None
-                gelbooru_tags = post_data.get('tags') if post_data else None
-
-                danbooru_id = None
-                db_post = None
-                danbooru_image_url = None
-                if md5:
-                    self.log(LANG[lang]['search_md5'])
-                    danbooru_id = search_on_danbooru_by_md5(md5)
-                    if danbooru_id:
-                        self.log(LANG[lang]['found_md5'])
-                        db_post = fetch_danbooru_post(danbooru_id)
-                        if db_post:
-                            danbooru_image_url = db_post.get('file_url')
-
-                if not danbooru_id and file_url:
-                    self.log(LANG[lang]['search_iqdb'])
-                    danbooru_id = search_on_danbooru_by_iqdb(file_url)
-                    if danbooru_id:
-                        self.log(LANG[lang]['found_iqdb'])
-                        db_post = fetch_danbooru_post(danbooru_id)
-                        if db_post:
-                            danbooru_image_url = db_post.get('file_url')
-
-                sources = []
-                sources.append(('source', gelbooru_tags, 'Gelbooru', source_image_url))
-                if db_post and db_post.get('tags'):
-                    sources.append(('danbooru', db_post['tags'], danbooru_id, danbooru_image_url))
-
-                if db_post and db_post.get('tags') and source_image_url and danbooru_image_url:
-                    if md5 is None or db_post.get('md5') != md5:
-                        self.log(LANG[lang]['comparing_images'])
-                        if compare_images_by_hash(source_image_url, danbooru_image_url):
-                            self.log(LANG[lang]['images_match'].format('?'))
-                            sources = [('danbooru', db_post['tags'], danbooru_id, danbooru_image_url)]
-
-                if len(sources) == 1:
-                    src = sources[0]
-                    src_type, tags, identifier, img_url = src
-                    danbooru_url = None
-                    gelbooru_url = None
-                    if src_type == 'danbooru':
-                        danbooru_url = f"https://danbooru.donmai.us/posts/{identifier}"
-                        if img_url:
-                            self.set_preview(img_url)
-                        saved = save_tags_to_file(tags, url, self.save_folder.get(),
-                                                  danbooru_url=danbooru_url,
-                                                  domain_slug=domain_slug, post_id=file_id)
-                        self.log(LANG[lang]['saved_from_danbooru'].format(len(tags), os.path.basename(saved)))
-                    else:
-                        saved = save_tags_to_file(tags, url, self.save_folder.get(),
-                                                  domain_slug=domain_slug, post_id=file_id)
-                        self.log(LANG[lang]['saved_from_source'].format(len(tags), 'Gelbooru', os.path.basename(saved)))
-                else:
-                    self.user_choice_event.clear()
-                    self.after(0, lambda: self.ask_tag_source_and_continue(sources, url, domain_slug, file_id, lang))
-                    self.user_choice_event.wait()
-                    choice = self.user_choice_result
-                    if choice:
-                        src_type, tags, identifier, img_url = choice
-                        danbooru_url = None
-                        gelbooru_url = None
-                        if src_type == 'danbooru':
-                            danbooru_url = f"https://danbooru.donmai.us/posts/{identifier}"
-                            if img_url:
-                                self.set_preview(img_url)
-                            saved = save_tags_to_file(tags, url, self.save_folder.get(),
-                                                      danbooru_url=danbooru_url,
-                                                      domain_slug=domain_slug, post_id=file_id)
-                            self.log(LANG[lang]['saved_from_danbooru'].format(len(tags), os.path.basename(saved)))
-                        else:
-                            saved = save_tags_to_file(tags, url, self.save_folder.get(),
-                                                      domain_slug=domain_slug, post_id=file_id)
-                            self.log(LANG[lang]['saved_from_source'].format(len(tags), 'Gelbooru', os.path.basename(saved)))
-                    else:
-                        saved = save_tags_to_file(gelbooru_tags, url, self.save_folder.get(),
-                                                  domain_slug=domain_slug, post_id=file_id)
-                        self.log(LANG[lang]['saved_from_source'].format(len(gelbooru_tags), 'Gelbooru', os.path.basename(saved)))
             else:
                 self.log(LANG[lang]['unsupported_domain'].format(domain))
         except Exception as e:

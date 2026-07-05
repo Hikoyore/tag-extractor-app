@@ -10,13 +10,148 @@ from PIL import Image, ImageTk
 import io
 import locale
 import tempfile
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('TagExtractor')
+
+CONFIG = {
+    'DANBOORU_BASE': 'https://danbooru.donmai.us',
+    'USER_AGENT': 'TagExtractor/3.0',
+    'TIMEOUT': 15,
+    'RETRIES': 3,
+    'BACKOFF': 2,
+}
 
 http_session = requests.Session()
+http_session.headers.update({'User-Agent': CONFIG['USER_AGENT']})
 cache = {}
+
+def retry_on_error(max_tries=CONFIG['RETRIES'], backoff=CONFIG['BACKOFF']):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, max_tries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except requests.HTTPError as e:
+                    if e.response.status_code == 429:
+                        retry_after = int(e.response.headers.get('Retry-After', backoff ** attempt))
+                        logger.warning(f"429 Too Many Requests, sleep {retry_after}s")
+                        time.sleep(retry_after)
+                        continue
+                    raise
+                except Exception as e:
+                    if attempt == max_tries:
+                        raise
+                    wait = backoff ** attempt
+                    logger.warning(f"Error: {e}, retry in {wait}s ({attempt}/{max_tries})")
+                    time.sleep(wait)
+            return None
+        return wrapper
+    return decorator
+
+class DanbooruClient:
+    def __init__(self, login: str = None, api_key: str = None):
+        self.login = login
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': CONFIG['USER_AGENT'],
+            'Accept': 'application/json',
+        })
+        self.danbooru_cache = {}
+
+    def _auth_params(self, extra: dict = None) -> dict:
+        params = extra or {}
+        if self.login and self.api_key:
+            params.update({'login': self.login, 'api_key': self.api_key})
+        return params
+
+    @retry_on_error()
+    def _get(self, endpoint: str, params: dict = None) -> dict:
+        url = f"{CONFIG['DANBOORU_BASE']}{endpoint}"
+        resp = self.session.get(url, params=params, timeout=CONFIG['TIMEOUT'])
+        resp.raise_for_status()
+        return resp.json()
+
+    def parse_tags(self, post: dict) -> list:
+        raw = post.get('tag_string', '')
+        return [tag.replace('_', ' ') for tag in raw.split()] if raw else []
+
+    @retry_on_error()
+    def get_post(self, identifier: str) -> dict or None:
+        if identifier in self.danbooru_cache:
+            logger.info(f"Danbooru cache hit: {identifier}")
+            return self.danbooru_cache[identifier]
+
+        if str(identifier).startswith('md5:'):
+            tag = identifier
+        else:
+            tag = f'id:{identifier}'
+        params = self._auth_params({'tags': tag})
+
+        data = self._get('/posts.json', params)
+        if not data:
+            return None
+
+        post = data[0]
+        result = {
+            'id': post['id'],
+            'tags': self.parse_tags(post),
+            'file_url': post.get('file_url'),
+            'md5': post.get('md5'),
+            'source': post.get('source'),
+        }
+        self.danbooru_cache[identifier] = result
+        return result
+
+    @retry_on_error()
+    def search_by_md5(self, md5: str) -> dict or None:
+        cache_key = f"md5_{md5}"
+        if cache_key in self.danbooru_cache:
+            return self.danbooru_cache[cache_key]
+
+        params = self._auth_params({'tags': f'md5:{md5}'})
+        data = self._get('/posts.json', params)
+        if not data:
+            return None
+
+        post = data[0]
+        result = {
+            'id': post['id'],
+            'tags': self.parse_tags(post),
+            'file_url': post.get('file_url'),
+            'md5': post.get('md5'),
+            'source': post.get('source'),
+        }
+        self.danbooru_cache[cache_key] = result
+        return result
+
+    def search_by_iqdb(self, image_url: str) -> str or None:
+        try:
+            img_resp = self.session.get(image_url, timeout=CONFIG['TIMEOUT'])
+            if img_resp.status_code != 200:
+                return None
+            files = {'file': ('image.jpg', img_resp.content, 'image/jpeg')}
+            iqdb_resp = requests.post('https://iqdb.org/', files=files, timeout=20)
+            if iqdb_resp.status_code != 200:
+                return None
+            match = re.search(r'danbooru\.donmai\.us/posts/(\d+)', iqdb_resp.text)
+            return match.group(1) if match else None
+        except Exception as e:
+            logger.warning(f"IQDB error: {e}")
+            return None
+
+    @staticmethod
+    def post_url(post_id: int) -> str:
+        return f"{CONFIG['DANBOORU_BASE']}/posts/{post_id}"
 
 LANG = {
     'ru': {
         'title': 'Tag Extractor',
+        'tab_main': 'Главная',
+        'tab_settings': 'Настройки',
         'lang_label': 'Язык',
         'url_label': 'URL:',
         'process_btn': 'Извлечь теги',
@@ -77,10 +212,18 @@ LANG = {
         'saved_from_gelbooru': '✅ Сохранено {} тегов с Gelbooru в {}',
         'comparing_images': '🔎 Сравниваю изображения по содержимому...',
         'images_match': '✅ Изображения совпадают (расстояние Хэмминга: {}). Использую Danbooru.',
-        'images_differ': '⚠️ Изображения визуально различаются. Требуется выбор.'
+        'images_differ': '⚠️ Изображения визуально различаются. Требуется выбор.',
+        'settings_folder': 'Папка для сохранения:',
+        'settings_login': 'Логин Danbooru:',
+        'settings_api_key': 'API-ключ:',
+        'settings_apply': 'Применить',
+        'auth_applied': '🔑 Авторизация Danbooru обновлена',
+        'auth_empty': '🔓 Работа без авторизации',
     },
     'en': {
         'title': 'Tag Extractor',
+        'tab_main': 'Main',
+        'tab_settings': 'Settings',
         'lang_label': 'Language',
         'url_label': 'URL:',
         'process_btn': 'Extract tags',
@@ -141,7 +284,13 @@ LANG = {
         'saved_from_gelbooru': '✅ Saved {} tags from Gelbooru to {}',
         'comparing_images': '🔎 Comparing images by content...',
         'images_match': '✅ Images match (Hamming distance: {}). Using Danbooru.',
-        'images_differ': '⚠️ Images visually differ. Choice required.'
+        'images_differ': '⚠️ Images visually differ. Choice required.',
+        'settings_folder': 'Save folder:',
+        'settings_login': 'Danbooru login:',
+        'settings_api_key': 'API key:',
+        'settings_apply': 'Apply',
+        'auth_applied': '🔑 Danbooru authorization updated',
+        'auth_empty': '🔓 Working without authorization',
     }
 }
 
@@ -196,38 +345,6 @@ def extract_identifier(url):
             return domain, m.group(1)
 
     return None, None
-
-def fetch_danbooru_post(identifier):
-    cache_key = ('danbooru', identifier)
-    if cache_key in cache:
-        return cache[cache_key]
-
-    if str(identifier).startswith('md5:'):
-        params = {'tags': identifier}
-    else:
-        params = {'tags': f'id:{identifier}'}
-    url = 'https://danbooru.donmai.us/posts.json'
-
-    try:
-        resp = http_session.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, list) or len(data) == 0:
-            cache[cache_key] = None
-            return None
-        post = data[0]
-        raw_tags = post.get('tag_string', '').split()
-        tags = [clean_tag(t) for t in raw_tags] if raw_tags else None
-        result = {
-            'tags': tags,
-            'file_url': post.get('file_url'),
-            'md5': post.get('md5')
-        }
-        cache[cache_key] = result
-        return result
-    except:
-        cache[cache_key] = None
-        return None
 
 def fetch_aibooru_post(identifier, base_url='https://aibooru.online'):
     cache_key = ('aibooru', base_url, identifier)
@@ -488,34 +605,6 @@ def get_image_info_from_source(domain, identifier):
             return {'file_url': post['file_url'], 'md5': post['md5']}
     return {'file_url': None, 'md5': None}
 
-def search_on_danbooru_by_md5(md5):
-    url = f"https://danbooru.donmai.us/posts.json?tags=md5:{md5}"
-    try:
-        resp = http_session.get(url, timeout=10)
-        data = resp.json()
-        if data and len(data) > 0:
-            return data[0].get('id')
-    except:
-        pass
-    return None
-
-def search_on_danbooru_by_iqdb(image_url):
-    try:
-        img_resp = http_session.get(image_url, stream=True, timeout=15)
-        if img_resp.status_code != 200:
-            return None
-        files = {'file': ('image.jpg', img_resp.content, 'image/jpeg')}
-        iqdb_resp = requests.post('https://iqdb.org/', files=files, timeout=20)
-        if iqdb_resp.status_code != 200:
-            return None
-        pattern = r'danbooru\.donmai\.us/posts/(\d+)'
-        matches = re.findall(pattern, iqdb_resp.text)
-        if matches:
-            return matches[0]
-    except:
-        pass
-    return None
-
 def search_on_gelbooru_by_md5(md5):
     url = "https://gelbooru.com/index.php"
     params = {
@@ -655,8 +744,9 @@ class TagExtractorApp(tk.Tk):
 
         self.current_lang = tk.StringVar(value='ru')
         self.save_folder = tk.StringVar(value=tempfile.gettempdir())
-
-        self.create_widgets()
+        self.danbooru_login = tk.StringVar(value='')
+        self.danbooru_api_key = tk.StringVar(value='')
+        self.danbooru_client = None
 
         self.current_image_url = None
         self.preview_image = None
@@ -672,13 +762,37 @@ class TagExtractorApp(tk.Tk):
         if sys_lang not in ['ru', 'en']:
             sys_lang = 'en'
         self.current_lang.set(sys_lang)
+
+        self.create_widgets()
         self.update_language()
+
+        self._apply_auth()
 
         self.user_choice_event = threading.Event()
         self.user_choice_result = None
 
+    def _apply_auth(self):
+        login = self.danbooru_login.get().strip()
+        api_key = self.danbooru_api_key.get().strip()
+        self.danbooru_client = DanbooruClient(login if login else None,
+                                              api_key if api_key else None)
+        lang_dict = LANG[self.current_lang.get()]
+        if login and api_key:
+            self.log(lang_dict['auth_applied'])
+        else:
+            self.log(lang_dict['auth_empty'])
+
     def create_widgets(self):
-        top_frame = ttk.Frame(self, padding="5")
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.main_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.main_tab, text="Главная")
+
+        self.settings_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.settings_tab, text="Настройки")
+
+        top_frame = ttk.Frame(self.main_tab, padding="5")
         top_frame.pack(fill=tk.X)
 
         self.lang_label = ttk.Label(top_frame, text=LANG['ru']['lang_label'])
@@ -687,14 +801,11 @@ class TagExtractorApp(tk.Tk):
         self.lang_combo.grid(row=0, column=1, padx=5, sticky=tk.W)
         self.lang_combo.bind('<<ComboboxSelected>>', self.on_lang_change)
 
-        self.folder_btn = ttk.Button(top_frame, text=LANG['ru']['folder_btn'], command=self.select_folder)
-        self.folder_btn.grid(row=0, column=2, padx=5)
-
         self.folder_label = ttk.Label(top_frame, text="", foreground="blue")
-        self.folder_label.grid(row=0, column=3, padx=5, sticky=tk.W)
+        self.folder_label.grid(row=0, column=2, columnspan=2, padx=5, sticky=tk.W)
         self.update_folder_label()
 
-        url_frame = ttk.Frame(self, padding="5")
+        url_frame = ttk.Frame(self.main_tab, padding="5")
         url_frame.pack(fill=tk.X)
 
         self.url_label = ttk.Label(url_frame, text=LANG['ru']['url_label'])
@@ -714,10 +825,9 @@ class TagExtractorApp(tk.Tk):
         self.create_context_menu(self.url_entry)
 
         self.url_entry.bind('<Return>', lambda e: self.process_url_thread())
-
         self.url_entry.bind('<Control-KeyPress>', self.on_url_ctrl_key)
 
-        btn_frame = ttk.Frame(self, padding="5")
+        btn_frame = ttk.Frame(self.main_tab, padding="5")
         btn_frame.pack(fill=tk.X)
 
         self.process_btn = ttk.Button(btn_frame, text=LANG['ru']['process_btn'], command=self.process_url_thread)
@@ -732,7 +842,7 @@ class TagExtractorApp(tk.Tk):
         self.exit_btn = ttk.Button(btn_frame, text=LANG['ru']['exit_btn'], command=self.quit)
         self.exit_btn.pack(side=tk.LEFT, padx=2)
 
-        main_panel = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main_panel = ttk.PanedWindow(self.main_tab, orient=tk.HORIZONTAL)
         main_panel.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         left_frame = ttk.Frame(main_panel)
@@ -758,8 +868,48 @@ class TagExtractorApp(tk.Tk):
 
         self.status_var = tk.StringVar()
         self.status_var.set(LANG['ru']['status_ready'])
-        status_bar = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar = ttk.Label(self.main_tab, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        settings_frame = ttk.Frame(self.settings_tab, padding="10")
+        settings_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(settings_frame, text=LANG['ru']['settings_folder']).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.settings_folder_entry = ttk.Entry(settings_frame, textvariable=self.save_folder, width=50)
+        self.settings_folder_entry.grid(row=0, column=1, padx=5, sticky=tk.EW)
+        ttk.Button(settings_frame, text=LANG['ru']['folder_btn'], command=self.select_folder_settings).grid(row=0, column=2, padx=5)
+
+        ttk.Label(settings_frame, text=LANG['ru']['settings_login']).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.login_entry = ttk.Entry(settings_frame, textvariable=self.danbooru_login, width=30)
+        self.login_entry.grid(row=1, column=1, padx=5, sticky=tk.W)
+
+        ttk.Label(settings_frame, text=LANG['ru']['settings_api_key']).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.api_key_entry = ttk.Entry(settings_frame, textvariable=self.danbooru_api_key, width=40, show='*')
+        self.api_key_entry.grid(row=2, column=1, padx=5, sticky=tk.W)
+
+        self.apply_settings_btn = ttk.Button(settings_frame, text=LANG['ru']['settings_apply'], command=self.apply_settings)
+        self.apply_settings_btn.grid(row=3, column=0, columnspan=3, pady=10)
+
+        settings_frame.columnconfigure(1, weight=1)
+
+    def select_folder_settings(self):
+        folder = filedialog.askdirectory(initialdir=self.save_folder.get(),
+                                         title=LANG[self.current_lang.get()]['select_folder'])
+        if folder:
+            self.save_folder.set(folder)
+            self.update_folder_label()
+
+    def apply_settings(self):
+        self._apply_auth()
+
+    def update_folder_label(self):
+        folder = self.save_folder.get()
+        if len(folder) > 50:
+            display = "..." + folder[-47:]
+        else:
+            display = folder
+        lang_dict = LANG[self.current_lang.get()]
+        self.folder_label.config(text=f"{lang_dict['current_folder']} {display}")
 
     def create_context_menu(self, widget):
         menu = tk.Menu(widget, tearoff=0)
@@ -802,29 +952,15 @@ class TagExtractorApp(tk.Tk):
     def cut_text(self, widget):
         widget.event_generate("<<Cut>>")
 
-    def update_folder_label(self):
-        folder = self.save_folder.get()
-        if len(folder) > 50:
-            display = "..." + folder[-47:]
-        else:
-            display = folder
-        self.folder_label.config(text=display)
-
-    def select_folder(self):
-        folder = filedialog.askdirectory(initialdir=self.save_folder.get(),
-                                         title=LANG[self.current_lang.get()]['select_folder'])
-        if folder:
-            self.save_folder.set(folder)
-            self.update_folder_label()
-
     def on_lang_change(self, event=None):
         self.update_language()
 
     def update_language(self):
         lang = self.current_lang.get()
+        self.notebook.tab(self.main_tab, text=LANG[lang]['tab_main'])
+        self.notebook.tab(self.settings_tab, text=LANG[lang]['tab_settings'])
         self.lang_label.config(text=LANG[lang]['lang_label'])
         self.url_label.config(text=LANG[lang]['url_label'])
-        self.folder_btn.config(text=LANG[lang]['folder_btn'])
         self.process_btn.config(text=LANG[lang]['process_btn'])
         self.merge_btn.config(text=LANG[lang]['merge_btn'])
         self.clear_btn.config(text=LANG[lang]['clear_btn'])
@@ -834,6 +970,18 @@ class TagExtractorApp(tk.Tk):
         self.status_var.set(LANG[lang]['status_ready'])
         if not self.preview_image:
             self.preview_label.config(text=LANG[lang]['preview_not_available'])
+        self.apply_settings_btn.config(text=LANG[lang]['settings_apply'])
+        for child in self.settings_tab.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for widget in child.winfo_children():
+                    if isinstance(widget, ttk.Label):
+                        if widget.cget('text') in [LANG['ru']['settings_folder'], LANG['en']['settings_folder']]:
+                            widget.config(text=LANG[lang]['settings_folder'])
+                        elif widget.cget('text') in [LANG['ru']['settings_login'], LANG['en']['settings_login']]:
+                            widget.config(text=LANG[lang]['settings_login'])
+                        elif widget.cget('text') in [LANG['ru']['settings_api_key'], LANG['en']['settings_api_key']]:
+                            widget.config(text=LANG[lang]['settings_api_key'])
+        self.update_folder_label()
 
     def log(self, message):
         self.log_text.insert(tk.END, message + "\n")
@@ -983,8 +1131,11 @@ class TagExtractorApp(tk.Tk):
             domain_slug = domain.replace('.', '_')
 
             if 'danbooru.donmai.us' in domain:
+                if not self.danbooru_client:
+                    self.log("❌ Danbooru client not initialized. Check settings.")
+                    return
                 self.log(LANG[lang]['direct_request'].format(domain))
-                post_data = fetch_danbooru_post(identifier)
+                post_data = self.danbooru_client.get_post(identifier)
                 if not post_data or not post_data['tags']:
                     self.log(LANG[lang]['error_no_tags'])
                     return
@@ -1028,28 +1179,27 @@ class TagExtractorApp(tk.Tk):
                 danbooru_id = None
                 db_post = None
                 danbooru_image_url = None
-                if md5:
+                if md5 and self.danbooru_client:
                     self.log(LANG[lang]['search_md5'])
-                    danbooru_id = search_on_danbooru_by_md5(md5)
-                    if danbooru_id:
+                    db_post = self.danbooru_client.search_by_md5(md5)
+                    if db_post:
                         self.log(LANG[lang]['found_md5'])
-                        db_post = fetch_danbooru_post(danbooru_id)
-                        if db_post:
-                            danbooru_image_url = db_post.get('file_url')
+                        danbooru_image_url = db_post.get('file_url')
 
-                if not danbooru_id and file_url:
+                if not db_post and file_url and self.danbooru_client:
                     self.log(LANG[lang]['search_iqdb'])
-                    danbooru_id = search_on_danbooru_by_iqdb(file_url)
+                    danbooru_id = self.danbooru_client.search_by_iqdb(file_url)
                     if danbooru_id:
                         self.log(LANG[lang]['found_iqdb'])
-                        db_post = fetch_danbooru_post(danbooru_id)
+                        db_post = self.danbooru_client.get_post(danbooru_id)
                         if db_post:
                             danbooru_image_url = db_post.get('file_url')
 
                 sources = []
-                sources.append(('source', konachan_tags, 'Konachan', source_image_url))
+                if konachan_tags:
+                    sources.append(('source', konachan_tags, 'Konachan', source_image_url))
                 if db_post and db_post.get('tags'):
-                    sources.append(('danbooru', db_post['tags'], danbooru_id, danbooru_image_url))
+                    sources.append(('danbooru', db_post['tags'], db_post['id'], danbooru_image_url))
 
                 if (not db_post or not db_post.get('tags')) and file_url:
                     self.log(LANG[lang]['search_gelbooru'])
@@ -1065,17 +1215,17 @@ class TagExtractorApp(tk.Tk):
                         self.log(LANG[lang]['comparing_images'])
                         if compare_images_by_hash(source_image_url, danbooru_image_url):
                             self.log(LANG[lang]['images_match'].format('?'))
-                            sources = [('danbooru', db_post['tags'], danbooru_id, danbooru_image_url)]
+                            sources = [('danbooru', db_post['tags'], db_post['id'], danbooru_image_url)]
                         else:
                             self.log(LANG[lang]['images_differ'])
 
                 if len(sources) == 1:
                     src = sources[0]
-                    src_type, tags, identifier, img_url = src
+                    src_type, tags, ident, img_url = src
                     danbooru_url = None
                     gelbooru_url = None
                     if src_type == 'danbooru':
-                        danbooru_url = f"https://danbooru.donmai.us/posts/{identifier}"
+                        danbooru_url = self.danbooru_client.post_url(ident)
                         if img_url:
                             self.set_preview(img_url)
                         saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1083,7 +1233,7 @@ class TagExtractorApp(tk.Tk):
                                                   domain_slug=domain_slug, post_id=file_id)
                         self.log(LANG[lang]['saved_from_danbooru'].format(len(tags), os.path.basename(saved)))
                     elif src_type == 'gelbooru':
-                        gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={identifier}"
+                        gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={ident}"
                         if img_url:
                             self.set_preview(img_url)
                         saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1100,11 +1250,11 @@ class TagExtractorApp(tk.Tk):
                     self.user_choice_event.wait()
                     choice = self.user_choice_result
                     if choice:
-                        src_type, tags, identifier, img_url = choice
+                        src_type, tags, ident, img_url = choice
                         danbooru_url = None
                         gelbooru_url = None
                         if src_type == 'danbooru':
-                            danbooru_url = f"https://danbooru.donmai.us/posts/{identifier}"
+                            danbooru_url = self.danbooru_client.post_url(ident)
                             if img_url:
                                 self.set_preview(img_url)
                             saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1112,7 +1262,7 @@ class TagExtractorApp(tk.Tk):
                                                       domain_slug=domain_slug, post_id=file_id)
                             self.log(LANG[lang]['saved_from_danbooru'].format(len(tags), os.path.basename(saved)))
                         elif src_type == 'gelbooru':
-                            gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={identifier}"
+                            gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={ident}"
                             if img_url:
                                 self.set_preview(img_url)
                             saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1124,9 +1274,12 @@ class TagExtractorApp(tk.Tk):
                                                       domain_slug=domain_slug, post_id=file_id)
                             self.log(LANG[lang]['saved_from_source'].format(len(tags), 'Konachan', os.path.basename(saved)))
                     else:
-                        saved = save_tags_to_file(konachan_tags, url, self.save_folder.get(),
-                                                  domain_slug=domain_slug, post_id=file_id)
-                        self.log(LANG[lang]['saved_from_source'].format(len(konachan_tags), 'Konachan', os.path.basename(saved)))
+                        if konachan_tags:
+                            saved = save_tags_to_file(konachan_tags, url, self.save_folder.get(),
+                                                      domain_slug=domain_slug, post_id=file_id)
+                            self.log(LANG[lang]['saved_from_source'].format(len(konachan_tags), 'Konachan', os.path.basename(saved)))
+                        else:
+                            self.log(LANG[lang]['error_no_tags'])
 
             elif 'yande.re' in domain:
                 self.log(LANG[lang]['source_info'].format(domain, identifier))
@@ -1147,28 +1300,27 @@ class TagExtractorApp(tk.Tk):
                 danbooru_id = None
                 db_post = None
                 danbooru_image_url = None
-                if md5:
+                if md5 and self.danbooru_client:
                     self.log(LANG[lang]['search_md5'])
-                    danbooru_id = search_on_danbooru_by_md5(md5)
-                    if danbooru_id:
+                    db_post = self.danbooru_client.search_by_md5(md5)
+                    if db_post:
                         self.log(LANG[lang]['found_md5'])
-                        db_post = fetch_danbooru_post(danbooru_id)
-                        if db_post:
-                            danbooru_image_url = db_post.get('file_url')
+                        danbooru_image_url = db_post.get('file_url')
 
-                if not danbooru_id and file_url:
+                if not db_post and file_url and self.danbooru_client:
                     self.log(LANG[lang]['search_iqdb'])
-                    danbooru_id = search_on_danbooru_by_iqdb(file_url)
+                    danbooru_id = self.danbooru_client.search_by_iqdb(file_url)
                     if danbooru_id:
                         self.log(LANG[lang]['found_iqdb'])
-                        db_post = fetch_danbooru_post(danbooru_id)
+                        db_post = self.danbooru_client.get_post(danbooru_id)
                         if db_post:
                             danbooru_image_url = db_post.get('file_url')
 
                 sources = []
-                sources.append(('source', yandere_tags, 'Yande.re', source_image_url))
+                if yandere_tags:
+                    sources.append(('source', yandere_tags, 'Yande.re', source_image_url))
                 if db_post and db_post.get('tags'):
-                    sources.append(('danbooru', db_post['tags'], danbooru_id, danbooru_image_url))
+                    sources.append(('danbooru', db_post['tags'], db_post['id'], danbooru_image_url))
 
                 if (not db_post or not db_post.get('tags')) and file_url:
                     self.log(LANG[lang]['search_gelbooru'])
@@ -1184,17 +1336,17 @@ class TagExtractorApp(tk.Tk):
                         self.log(LANG[lang]['comparing_images'])
                         if compare_images_by_hash(source_image_url, danbooru_image_url):
                             self.log(LANG[lang]['images_match'].format('?'))
-                            sources = [('danbooru', db_post['tags'], danbooru_id, danbooru_image_url)]
+                            sources = [('danbooru', db_post['tags'], db_post['id'], danbooru_image_url)]
                         else:
                             self.log(LANG[lang]['images_differ'])
 
                 if len(sources) == 1:
                     src = sources[0]
-                    src_type, tags, identifier, img_url = src
+                    src_type, tags, ident, img_url = src
                     danbooru_url = None
                     gelbooru_url = None
                     if src_type == 'danbooru':
-                        danbooru_url = f"https://danbooru.donmai.us/posts/{identifier}"
+                        danbooru_url = self.danbooru_client.post_url(ident)
                         if img_url:
                             self.set_preview(img_url)
                         saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1202,7 +1354,7 @@ class TagExtractorApp(tk.Tk):
                                                   domain_slug=domain_slug, post_id=file_id)
                         self.log(LANG[lang]['saved_from_danbooru'].format(len(tags), os.path.basename(saved)))
                     elif src_type == 'gelbooru':
-                        gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={identifier}"
+                        gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={ident}"
                         if img_url:
                             self.set_preview(img_url)
                         saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1219,11 +1371,11 @@ class TagExtractorApp(tk.Tk):
                     self.user_choice_event.wait()
                     choice = self.user_choice_result
                     if choice:
-                        src_type, tags, identifier, img_url = choice
+                        src_type, tags, ident, img_url = choice
                         danbooru_url = None
                         gelbooru_url = None
                         if src_type == 'danbooru':
-                            danbooru_url = f"https://danbooru.donmai.us/posts/{identifier}"
+                            danbooru_url = self.danbooru_client.post_url(ident)
                             if img_url:
                                 self.set_preview(img_url)
                             saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1231,7 +1383,7 @@ class TagExtractorApp(tk.Tk):
                                                       domain_slug=domain_slug, post_id=file_id)
                             self.log(LANG[lang]['saved_from_danbooru'].format(len(tags), os.path.basename(saved)))
                         elif src_type == 'gelbooru':
-                            gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={identifier}"
+                            gelbooru_url = f"https://gelbooru.com/index.php?page=post&s=view&id={ident}"
                             if img_url:
                                 self.set_preview(img_url)
                             saved = save_tags_to_file(tags, url, self.save_folder.get(),
@@ -1243,9 +1395,12 @@ class TagExtractorApp(tk.Tk):
                                                       domain_slug=domain_slug, post_id=file_id)
                             self.log(LANG[lang]['saved_from_source'].format(len(tags), 'Yande.re', os.path.basename(saved)))
                     else:
-                        saved = save_tags_to_file(yandere_tags, url, self.save_folder.get(),
-                                                  domain_slug=domain_slug, post_id=file_id)
-                        self.log(LANG[lang]['saved_from_source'].format(len(yandere_tags), 'Yande.re', os.path.basename(saved)))
+                        if yandere_tags:
+                            saved = save_tags_to_file(yandere_tags, url, self.save_folder.get(),
+                                                      domain_slug=domain_slug, post_id=file_id)
+                            self.log(LANG[lang]['saved_from_source'].format(len(yandere_tags), 'Yande.re', os.path.basename(saved)))
+                        else:
+                            self.log(LANG[lang]['error_no_tags'])
 
             elif 'gelbooru.com' in domain:
                 self.log(LANG[lang]['source_info'].format(domain, identifier))

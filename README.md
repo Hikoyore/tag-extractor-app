@@ -1,4 +1,4 @@
-# Tag Extractor App
+# Tag Extractor 
 
 ![Иллюстрация к проекту](https://github.com/Hikoyore/tag-extractor-app/blob/main/preview/new.png)
 
@@ -9,17 +9,8 @@
 - requests - для HTTP-запросов к API сайтов
 - Pillow (PIL) - для обработки изображений
 
-## Поддерживаемые сайты
-- Danbooru (danbooru.donmai.us)
-- Gelbooru (gelbooru.com)
-- Konachan (konachan.com, konachan.net)
-- Yande.re (yande.re)
-- AIBooru (aibooru.online)
+exe-файл расположен в разделе "Release"
 _________________________________________________________________________
-
-# Tag Extractor App
-
-![Иллюстрация к проекту](https://github.com/Hikoyore/tag-extractor-app/blob/main/preview/new.png)
 
 ## Requirements
 
@@ -28,9 +19,4 @@ _________________________________________________________________________
 - requests — for HTTP requests to site APIs
 - Pillow (PIL) — for image processing
 
-## Supported Sites
-- Danbooru (danbooru.donmai.us)
-- Gelbooru (gelbooru.com)
-- Konachan (konachan.com, konachan.net)
-- Yande.re (yande.re)
-- AIBooru (aibooru.online)
+The .exe file is located in the "Release" section.
